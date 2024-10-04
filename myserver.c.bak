@@ -1,0 +1,147 @@
+#include <signal.h>
+#include <stdio.h>
+
+#include "open62541.h"
+
+UA_Boolean running = true;
+
+/* 서버 신뢰 목록을 수동으로 관리 */
+typedef struct {
+    UA_ByteString *certificates;
+    size_t size;
+} TrustList;
+
+TrustList trustList = {NULL, 0};  // 신뢰 목록을 저장할 구조체
+
+/* 종료 신호 처리기 */
+static void
+stopHandler(int sign) {
+    running = false;
+}
+
+/* PEM 파일 로드 함수 */
+UA_StatusCode
+loadFile(const char *path, UA_ByteString *bs) {
+    FILE *fp = fopen(path, "rb");
+    if(!fp) {
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+    fseek(fp, 0, SEEK_END);
+    long fileSize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    UA_ByteString_allocBuffer(bs, fileSize);
+    fread(bs->data, sizeof(UA_Byte), fileSize, fp);
+    fclose(fp);
+    return UA_STATUSCODE_GOOD;
+}
+
+/* 클라이언트 인증서를 신뢰 목록에 추가 */
+UA_StatusCode
+addClientCertificateToTrustList(UA_ServerConfig *config, const char *certPath) {
+    UA_ByteString clientCert = UA_BYTESTRING_NULL;
+    UA_StatusCode retval = loadFile(certPath, &clientCert);
+    if(retval != UA_STATUSCODE_GOOD) {
+        return retval;
+    }
+
+    // 신뢰 목록에 클라이언트 인증서를 수동으로 추가
+    trustList.certificates = (UA_ByteString *)UA_realloc(
+        trustList.certificates, (trustList.size + 1) * sizeof(UA_ByteString));
+    trustList.certificates[trustList.size] = clientCert;  // 인증서 추가
+    trustList.size++;
+
+    retval = UA_CertificateVerification_Trustlist(&config->certificateVerification,
+                                                  &clientCert, 1, NULL, 0, NULL, 0);
+    return retval;
+}
+
+/* 신뢰 목록 확인 */
+void
+verifyTrustList() {
+    if(trustList.size == 0) {
+        printf("Server Trust List is empty.\n");
+    } else {
+        printf("Server Trust List contains %zu certificates:\n", trustList.size);
+        for(size_t i = 0; i < trustList.size; i++) {
+            UA_ByteString *cert = &trustList.certificates[i];
+            printf("Certificate %zu: \n", i + 1);
+            printf("  Length: %zu bytes\n", cert->length);
+
+            // 인증서 내용을 16진수로 출력
+            printf("  Data: ");
+            for(size_t j = 0; j < cert->length; j++) {
+                printf("%02X ", cert->data[j]);
+            }
+            printf("\n");
+        }
+    }
+}
+
+int
+main(int argc, char **argv) {
+    signal(SIGINT, stopHandler);
+    signal(SIGTERM, stopHandler);
+
+    /* 서버 생성 */
+    UA_Server *server = UA_Server_new();
+    UA_ServerConfig *config = UA_Server_getConfig(server);
+
+    /* 인증서 및 개인 키 로드 */
+    UA_ByteString certificate = UA_BYTESTRING_NULL;
+    UA_ByteString privateKey = UA_BYTESTRING_NULL;
+
+    UA_StatusCode retval = loadFile("server_cert.der", &certificate);
+    if(retval != UA_STATUSCODE_GOOD) {
+        printf("Error loading certificate\n");
+        return (int)retval;
+    }
+
+    retval = loadFile("server_key.pem", &privateKey);
+    if(retval != UA_STATUSCODE_GOOD) {
+        printf("Error loading private key\n");
+        UA_ByteString_clear(&certificate);
+        return (int)retval;
+    }
+
+    /* 기본 보안 정책 설정 */
+    retval = UA_ServerConfig_setDefaultWithSecurityPolicies(
+        config, 4840, &certificate, &privateKey, NULL, 0, NULL, 0, NULL, 0);
+    if(retval != UA_STATUSCODE_GOOD) {
+        printf("Error adding security policies\n");
+        UA_ByteString_clear(&certificate);
+        UA_ByteString_clear(&privateKey);
+        return (int)retval;
+    }
+
+    /* ApplicationURI 설정 */
+    UA_String applicationUri = UA_STRING("urn:my_custom_application_uri");
+    UA_String_copy(&applicationUri, &config->applicationDescription.applicationUri);
+
+    /* 클라이언트 인증서를 신뢰 목록에 추가 */
+    if(addClientCertificateToTrustList(config, "client_cert.der") != UA_STATUSCODE_GOOD) {
+        printf("Error adding client certificate to trust list\n");
+        return -1;
+    }
+
+    /* 서버 시작 */
+    retval = UA_Server_run_startup(server);
+    if(retval != UA_STATUSCODE_GOOD) {
+        printf("Server startup failed\n");
+        return (int)retval;
+    }
+
+    /* 신뢰 목록 출력 */
+    verifyTrustList();
+
+    while(running) {
+        UA_Server_run_iterate(server, true);
+    }
+
+    /* 서버 종료 */
+    UA_Server_run_shutdown(server);
+    UA_ByteString_clear(&certificate);
+    UA_ByteString_clear(&privateKey);
+    UA_Server_delete(server);
+
+    return 0;
+}
